@@ -1,0 +1,8 @@
+{
+    "name": "Gamut Tamer",
+    "description": "Applies a DCI-P3 to sRGB gamut correction shader on the entire display",
+    "uuid": "gamut-tamer@local",
+    "shell-version": ["46"],
+    "settings-schema": "org.gnome.shell.extensions.gamut-tamer",
+    "url": ""
+}
