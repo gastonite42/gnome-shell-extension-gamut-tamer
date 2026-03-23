@@ -102,40 +102,58 @@ class GamutEffect extends Clutter.ShaderEffect {
     }
 
     vfunc_paint_target(node, paintContext) {
-        this.set_uniform_value('tex', 0);
-        this._setFloat('BOOST', this._boost);
-        this._setFloat('STRENGTH', this._strength);
-
-        if (!this._targetGeometry || !paintContext) {
-            // No target set — apply to all monitors
-            this._setMonitorAll();
-        } else {
-            const fb = paintContext.get_framebuffer();
-            const [, , fbW, fbH] = fb.get_viewport4fv();
-            const tgt = this._targetGeometry;
-            const stageW = this.get_actor().get_width();
-            const stageH = this.get_actor().get_height();
-
-            if (Math.abs(fbW - stageW) < 5 && Math.abs(fbH - stageH) < 5) {
-                // X11: single framebuffer for entire stage — UV clipping
-                this._setFloat('MONITOR_LEFT', tgt.x / fbW);
-                this._setFloat('MONITOR_TOP', tgt.y / fbH);
-                this._setFloat('MONITOR_RIGHT', (tgt.x + tgt.width) / fbW);
-                this._setFloat('MONITOR_BOTTOM', (tgt.y + tgt.height) / fbH);
-            } else {
-                // Wayland: per-view framebuffer — detect if this view
-                // is the target by matching framebuffer size to monitor size
-                const isTarget =
-                    Math.abs(fbW - tgt.width) < 5 &&
-                    Math.abs(fbH - tgt.height) < 5;
-                if (isTarget)
-                    this._setMonitorAll();
-                else
-                    this._setMonitorNone();
-            }
+        // During screenshot/offscreen paints, node or paintContext may be
+        // null/invalid — pass through to avoid crashing gnome-shell.
+        if (!node || !paintContext) {
+            super.vfunc_paint_target(node, paintContext);
+            return;
         }
 
-        super.vfunc_paint_target(node, paintContext);
+        try {
+            this.set_uniform_value('tex', 0);
+            this._setFloat('BOOST', this._boost);
+            this._setFloat('STRENGTH', this._strength);
+
+            const actor = this.get_actor();
+            const fb = paintContext.get_framebuffer();
+
+            if (!this._targetGeometry || !actor || !fb) {
+                this._setMonitorAll();
+            } else {
+                const viewport = fb.get_viewport4fv();
+                if (!viewport) {
+                    this._setMonitorAll();
+                } else {
+                    const [, , fbW, fbH] = viewport;
+                    const tgt = this._targetGeometry;
+                    const stageW = actor.get_width();
+                    const stageH = actor.get_height();
+
+                    if (Math.abs(fbW - stageW) < 5 && Math.abs(fbH - stageH) < 5) {
+                        // X11: single framebuffer for entire stage — UV clipping
+                        this._setFloat('MONITOR_LEFT', tgt.x / fbW);
+                        this._setFloat('MONITOR_TOP', tgt.y / fbH);
+                        this._setFloat('MONITOR_RIGHT', (tgt.x + tgt.width) / fbW);
+                        this._setFloat('MONITOR_BOTTOM', (tgt.y + tgt.height) / fbH);
+                    } else {
+                        // Wayland: per-view framebuffer — detect if this view
+                        // is the target by matching framebuffer size to monitor size
+                        const isTarget =
+                            Math.abs(fbW - tgt.width) < 5 &&
+                            Math.abs(fbH - tgt.height) < 5;
+                        if (isTarget)
+                            this._setMonitorAll();
+                        else
+                            this._setMonitorNone();
+                    }
+                }
+            }
+
+            super.vfunc_paint_target(node, paintContext);
+        } catch (_e) {
+            // Safety net: never let the extension crash gnome-shell
+            super.vfunc_paint_target(node, paintContext);
+        }
     }
 });
 
@@ -272,9 +290,13 @@ export default class GamutTamerExtension extends Extension {
         // Panel indicator
         this._indicator = new GamutIndicator(this._settings, () => this.openPreferences());
         Main.panel.addToStatusArea('gamut-tamer', this._indicator);
+
+        this._wrapScreenshotUI();
     }
 
     disable() {
+        this._unwrapScreenshotUI();
+
         this._indicator?.destroy();
         this._indicator = null;
 
@@ -323,5 +345,33 @@ export default class GamutTamerExtension extends Extension {
     _connectSetting(key, callback) {
         const id = this._settings.connect(`changed::${key}`, callback);
         this._signalIds.push(id);
+    }
+
+    // Temporarily disable the effect during screenshot capture to prevent
+    // a SIGSEGV in Cogl when the shader runs against an offscreen framebuffer.
+    _wrapScreenshotUI() {
+        if (!Main.screenshotUI)
+            return;
+
+        const origOpen = Main.screenshotUI.open;
+        const effect = this._effect;
+
+        Main.screenshotUI.open = async function(...args) {
+            effect.set_enabled(false);
+            try {
+                return await origOpen.apply(this, args);
+            } finally {
+                effect.set_enabled(true);
+            }
+        };
+
+        this._origScreenshotOpen = origOpen;
+    }
+
+    _unwrapScreenshotUI() {
+        if (Main.screenshotUI && this._origScreenshotOpen) {
+            Main.screenshotUI.open = this._origScreenshotOpen;
+            this._origScreenshotOpen = null;
+        }
     }
 }
