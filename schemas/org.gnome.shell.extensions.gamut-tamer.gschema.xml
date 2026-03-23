@@ -2,6 +2,12 @@
 <schemalist gettext-domain="gamut-tamer">
   <schema id="org.gnome.shell.extensions.gamut-tamer" path="/org/gnome/shell/extensions/gamut-tamer/">
 
+    <key name="monitor-connector" type="s">
+      <default>''</default>
+      <summary>Target monitor connector</summary>
+      <description>Connector name of the monitor to apply correction to (e.g. "eDP-1"). Empty string applies to all monitors.</description>
+    </key>
+
     <key name="enabled" type="b">
       <default>true</default>
       <summary>Enable gamut correction</summary>

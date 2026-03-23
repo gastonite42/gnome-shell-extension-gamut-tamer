@@ -1,6 +1,7 @@
 'use strict';
 
 import Adw from 'gi://Adw';
+import Gdk from 'gi://Gdk';
 import Gtk from 'gi://Gtk';
 import Gio from 'gi://Gio';
 import {ExtensionPreferences} from 'resource:///org/gnome/Shell/Extensions/js/extensions/prefs.js';
@@ -21,6 +22,38 @@ export default class GamutTamerPreferences extends ExtensionPreferences {
             description: 'DCI-P3 → sRGB gamut correction',
         });
         page.add(group);
+
+        // Monitor selector
+        const monitorRow = new Adw.ComboRow({
+            title: 'Target Monitor',
+            subtitle: 'Apply correction only to this monitor',
+        });
+        const connectors = [''];
+        const labels = ['All monitors'];
+        const display = Gdk.Display.get_default();
+        const monitors = display.get_monitors();
+        for (let i = 0; i < monitors.get_n_items(); i++) {
+            const monitor = monitors.get_item(i);
+            const conn = monitor.get_connector();
+            const model = monitor.get_model() || '';
+            connectors.push(conn);
+            labels.push(model ? `${conn} (${model})` : conn);
+        }
+        const stringList = new Gtk.StringList();
+        for (const label of labels)
+            stringList.append(label);
+        monitorRow.set_model(stringList);
+        const currentConnector = settings.get_string('monitor-connector');
+        const currentIdx = connectors.indexOf(currentConnector);
+        monitorRow.set_selected(currentIdx >= 0 ? currentIdx : 0);
+        monitorRow.connect('notify::selected', () => {
+            settings.set_string('monitor-connector', connectors[monitorRow.get_selected()]);
+        });
+        settings.connect('changed::monitor-connector', () => {
+            const idx = connectors.indexOf(settings.get_string('monitor-connector'));
+            monitorRow.set_selected(idx >= 0 ? idx : 0);
+        });
+        group.add(monitorRow);
 
         // Enabled switch
         const enabledRow = new Adw.SwitchRow({
@@ -122,6 +155,7 @@ export default class GamutTamerPreferences extends ExtensionPreferences {
             css_classes: ['destructive-action'],
         });
         resetButton.connect('clicked', () => {
+            settings.reset('monitor-connector');
             settings.reset('enabled');
             settings.reset('boost');
             settings.reset('strength');

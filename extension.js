@@ -20,6 +20,10 @@ const SHADER_SOURCE = `
 uniform sampler2D tex;
 uniform float BOOST;
 uniform float STRENGTH;
+uniform float MONITOR_TOP;
+uniform float MONITOR_BOTTOM;
+uniform float MONITOR_LEFT;
+uniform float MONITOR_RIGHT;
 
 vec3 srgb_to_linear(vec3 c) {
     vec3 lo = c / 12.92;
@@ -34,7 +38,15 @@ vec3 linear_to_srgb(vec3 c) {
 }
 
 void main() {
-    vec4 c = texture2D(tex, cogl_tex_coord_in[0].st);
+    vec2 uv = cogl_tex_coord_in[0].st;
+    vec4 c = texture2D(tex, uv);
+
+    // Skip correction for pixels outside target monitor
+    if (uv.x < MONITOR_LEFT || uv.x > MONITOR_RIGHT ||
+        uv.y < MONITOR_TOP  || uv.y > MONITOR_BOTTOM) {
+        cogl_color_out = c;
+        return;
+    }
 
     mat3 correction = mat3(
         0.802682, 0.038366, 0.013611,
@@ -61,17 +73,69 @@ class GamutEffect extends Clutter.ShaderEffect {
         this.set_shader_source(this._source);
         this._boost = 1.4;
         this._strength = 1.0;
+        this._targetGeometry = null; // null = all monitors
+    }
+
+    // GJS may coerce integer-valued doubles (0.0, 1.0) to G_TYPE_INT,
+    // which maps to glUniform1i — invalid for GLSL uniform float.
+    _setFloat(name, value) {
+        this.set_uniform_value(name, Number.isInteger(value) ? value + 1e-6 : value);
     }
 
     vfunc_get_static_shader_source() {
         return this._source;
     }
 
-    vfunc_paint_target(...args) {
+    // Full UV range (correct all pixels) / empty range (skip all pixels)
+    _setMonitorAll() {
+        this._setFloat('MONITOR_LEFT', -0.1);
+        this._setFloat('MONITOR_TOP', -0.1);
+        this._setFloat('MONITOR_RIGHT', 1.1);
+        this._setFloat('MONITOR_BOTTOM', 1.1);
+    }
+
+    _setMonitorNone() {
+        this._setFloat('MONITOR_LEFT', -0.2);
+        this._setFloat('MONITOR_TOP', -0.2);
+        this._setFloat('MONITOR_RIGHT', -0.1);
+        this._setFloat('MONITOR_BOTTOM', -0.1);
+    }
+
+    vfunc_paint_target(node, paintContext) {
         this.set_uniform_value('tex', 0);
-        this.set_uniform_value('BOOST', this._boost);
-        this.set_uniform_value('STRENGTH', this._strength);
-        super.vfunc_paint_target(...args);
+        this._setFloat('BOOST', this._boost);
+        this._setFloat('STRENGTH', this._strength);
+
+        if (!this._targetGeometry || !paintContext) {
+            // No target set — apply to all monitors
+            this._setMonitorAll();
+        } else {
+            const fb = paintContext.get_framebuffer();
+            const [, , fbW, fbH] = fb.get_viewport4fv();
+            const tgt = this._targetGeometry;
+            const stageW = this.get_actor().get_width();
+            const stageH = this.get_actor().get_height();
+
+            if (Math.abs(fbW - stageW) < 5 && Math.abs(fbH - stageH) < 5) {
+                // X11: single framebuffer for entire stage — UV clipping
+                this._setFloat('MONITOR_LEFT', tgt.x / fbW);
+                this._setFloat('MONITOR_TOP', tgt.y / fbH);
+                this._setFloat('MONITOR_RIGHT', (tgt.x + tgt.width) / fbW);
+                this._setFloat('MONITOR_BOTTOM', (tgt.y + tgt.height) / fbH);
+            } else {
+                // Wayland: per-view framebuffer — detect if this view
+                // is the target by matching framebuffer size to monitor size
+                const isTarget =
+                    Math.abs(fbW - tgt.width) < 5 &&
+                    Math.abs(fbH - tgt.height) < 5;
+                if (isTarget)
+                    this._setMonitorAll();
+                else
+                    this._setMonitorNone();
+            }
+        }
+
+        super.vfunc_paint_target(node, paintContext);
     }
 });
 
@@ -146,7 +210,7 @@ class GamutIndicator extends PanelMenu.Button {
         slider.connect('notify::value', () => {
             const val = min + slider.value * range;
             this._settings.set_double(key, val);
-            labelItem.label.text = `${name}: ${val.toFixed(2)}`;
+            labelItem.label = `${name}: ${val.toFixed(2)}`;
         });
         sliderItem._slider = slider;
         sliderItem.add_child(slider);
@@ -174,6 +238,7 @@ export default class GamutTamerExtension extends Extension {
 
         this._effect._boost = this._settings.get_double('boost');
         this._effect._strength = this._settings.get_double('strength');
+        this._updateTargetMonitor();
 
         if (this._settings.get_boolean('enabled'))
             global.stage.add_effect(this._effect);
@@ -195,6 +260,15 @@ export default class GamutTamerExtension extends Extension {
             this._effect.queue_repaint();
         });
 
+        this._connectSetting('monitor-connector', () => {
+            this._updateTargetMonitor();
+        });
+
+        // Update when monitors change (plug/unplug, rearrange)
+        this._monitorsChangedId = Main.layoutManager.connect('monitors-changed', () => {
+            this._updateTargetMonitor();
+        });
+
         // Panel indicator
         this._indicator = new GamutIndicator(this._settings, () => this.openPreferences());
         Main.panel.addToStatusArea('gamut-tamer', this._indicator);
@@ -203,6 +277,11 @@ export default class GamutTamerExtension extends Extension {
     disable() {
         this._indicator?.destroy();
         this._indicator = null;
+
+        if (this._monitorsChangedId) {
+            Main.layoutManager.disconnect(this._monitorsChangedId);
+            this._monitorsChangedId = null;
+        }
 
         try {
             global.stage.remove_effect(this._effect);
@@ -215,6 +294,30 @@ export default class GamutTamerExtension extends Extension {
             this._settings?.disconnect(id);
         this._signalIds = [];
         this._settings = null;
+    }
+
+    _updateTargetMonitor() {
+        const connector = this._settings.get_string('monitor-connector');
+        if (!connector) {
+            // Empty string = apply to all monitors
+            this._effect._targetGeometry = null;
+            this._effect.queue_repaint();
+            return;
+        }
+
+        const monitorManager = global.backend.get_monitor_manager();
+        const index = monitorManager.get_monitor_for_connector(connector);
+        if (index >= 0) {
+            const rect = global.display.get_monitor_geometry(index);
+            this._effect._targetGeometry = {
+                x: rect.x, y: rect.y,
+                width: rect.width, height: rect.height,
+            };
+        } else {
+            // Connector not found — disable correction
+            this._effect._targetGeometry = {x: -1, y: -1, width: 0, height: 0};
+        }
+        this._effect.queue_repaint();
     }
 
     _connectSetting(key, callback) {
